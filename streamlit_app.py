@@ -42,6 +42,20 @@ texte_numero = st.sidebar.text_input(
     help="Exemple : 2633",
 )
 
+amendement_suivi = st.sidebar.text_input(
+    "Numéro d’amendement à suivre",
+    value="18",
+    help="Exemple : 18",
+)
+
+minutes_par_amendement_standard = st.sidebar.number_input(
+    "Base standard (minutes par amendement)",
+    min_value=1.0,
+    max_value=20.0,
+    value=2.0,
+    step=0.5,
+)
+
 st.sidebar.markdown(
     "Cette version utilise les pages publiques et l’open data de l’Assemblée nationale."
 )
@@ -100,6 +114,13 @@ def build_amendment_page_url(text_number: str, amend_number: int) -> str:
     )
 
 
+def safe_int(value: str) -> Optional[int]:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_amendment_record(text_number: str, amend_number: int) -> Optional[dict]:
     page_url = build_amendment_page_url(text_number, amend_number)
@@ -125,6 +146,7 @@ def fetch_amendment_record(text_number: str, amend_number: int) -> Optional[dict
 
     record = {
         "numero": str(amend_number),
+        "numero_int": amend_number,
         "page_url": page_url,
         "json_url": json_url,
         "titre": title,
@@ -153,6 +175,7 @@ def fetch_amendment_record(text_number: str, amend_number: int) -> Optional[dict
 
             if numero_long:
                 record["numero"] = str(numero_long)
+                record["numero_int"] = safe_int(numero_long)
 
             record["sort"] = sort_value
             record["date_sort"] = date_sort
@@ -167,8 +190,8 @@ def fetch_amendment_record(text_number: str, amend_number: int) -> Optional[dict
 @st.cache_data(ttl=120, show_spinner=False)
 def load_text_amendments(
     text_number: str,
-    max_scan: int = 400,
-    stop_after_missing: int = 30,
+    max_scan: int = 120,
+    stop_after_missing: int = 12,
 ) -> pd.DataFrame:
     records = []
     missing_streak = 0
@@ -190,14 +213,18 @@ def load_text_amendments(
 
     df = pd.DataFrame(records)
 
+    if "numero_int" not in df.columns:
+        df["numero_int"] = df["numero"].apply(safe_int)
+
     df["sort_normalized"] = df["sort"].apply(normalize_sort)
     df["terminal"] = df["sort_normalized"].apply(is_terminal_sort)
     df["date_sort_dt"] = df["date_sort"].apply(parse_iso_datetime)
 
     df = df.sort_values(
-        by="numero",
-        key=lambda s: pd.to_numeric(s, errors="coerce"),
-    )
+        by="numero_int",
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
 
     return df
 
@@ -217,6 +244,95 @@ def compute_pace(df: pd.DataFrame, minutes: int) -> Optional[float]:
 
     count = int((treated["date_sort_dt"] >= cutoff).sum())
     return round(count * (60 / minutes), 1)
+
+
+def format_duration(minutes: Optional[float]) -> str:
+    if minutes is None:
+        return "—"
+
+    total_minutes = int(round(minutes))
+
+    if total_minutes < 60:
+        return f"{total_minutes} min"
+
+    hours = total_minutes // 60
+    mins = total_minutes % 60
+    return f"{hours} h {mins:02d}"
+
+
+def format_eta_time(minutes_from_now: Optional[float]) -> str:
+    if minutes_from_now is None:
+        return "—"
+
+    eta = datetime.now() + timedelta(minutes=minutes_from_now)
+    return eta.strftime("%Hh%M")
+
+
+def compute_tracking_metrics(
+    df: pd.DataFrame,
+    target_number: str,
+    current_pace_per_hour: Optional[float],
+    standard_minutes_per_amendment: float,
+) -> dict:
+    if df.empty:
+        return {
+            "found": False,
+            "target_is_terminal": False,
+            "remaining_before": None,
+            "standard_eta_minutes": None,
+            "realtime_eta_minutes": None,
+            "realtime_eta_clock": None,
+        }
+
+    target_int = safe_int(target_number)
+    if target_int is None:
+        return {
+            "found": False,
+            "target_is_terminal": False,
+            "remaining_before": None,
+            "standard_eta_minutes": None,
+            "realtime_eta_minutes": None,
+            "realtime_eta_clock": None,
+        }
+
+    pending = df[~df["terminal"]].copy()
+    pending = pending[pending["numero_int"].notna()].copy()
+    pending = pending.sort_values("numero_int").reset_index(drop=True)
+
+    target_rows = pending[pending["numero_int"] == target_int]
+    if target_rows.empty:
+        all_rows = df[df["numero_int"] == target_int]
+        target_is_terminal = not all_rows.empty and bool(all_rows.iloc[0]["terminal"])
+        return {
+            "found": False,
+            "target_is_terminal": target_is_terminal,
+            "remaining_before": None,
+            "standard_eta_minutes": None,
+            "realtime_eta_minutes": None,
+            "realtime_eta_clock": None,
+        }
+
+    target_position = target_rows.index[0]
+    remaining_before = int(target_position)
+
+    standard_eta_minutes = remaining_before * standard_minutes_per_amendment
+
+    realtime_eta_minutes = None
+    realtime_eta_clock = None
+
+    if current_pace_per_hour is not None and current_pace_per_hour > 0:
+        minutes_per_amendment = 60 / current_pace_per_hour
+        realtime_eta_minutes = remaining_before * minutes_per_amendment
+        realtime_eta_clock = format_eta_time(realtime_eta_minutes)
+
+    return {
+        "found": True,
+        "target_is_terminal": False,
+        "remaining_before": remaining_before,
+        "standard_eta_minutes": standard_eta_minutes,
+        "realtime_eta_minutes": realtime_eta_minutes,
+        "realtime_eta_clock": realtime_eta_clock,
+    }
 
 
 def compute_metrics(df: pd.DataFrame) -> dict:
@@ -260,6 +376,13 @@ with st.spinner("Chargement des amendements du texte..."):
 
 metrics = compute_metrics(df)
 
+tracking = compute_tracking_metrics(
+    df=df,
+    target_number=amendement_suivi.strip(),
+    current_pace_per_hour=metrics["pace_hour"],
+    standard_minutes_per_amendment=float(minutes_par_amendement_standard),
+)
+
 if df.empty:
     st.error("Impossible de charger les amendements pour ce texte.")
     st.info("Vérifiez que le numéro saisi correspond bien au texte examiné, par exemple 2633.")
@@ -301,13 +424,50 @@ with col5:
 
 st.caption(f"Dernière mise à jour : {metrics['last_update']}")
 
+st.markdown("---")
+st.markdown(f"## Amendement suivi : {amendement_suivi or '—'}")
+
+if tracking["target_is_terminal"]:
+    st.warning("Cet amendement semble déjà traité.")
+elif not tracking["found"]:
+    st.info("Amendement non trouvé parmi les amendements encore en attente dans le périmètre chargé.")
+else:
+    t1, t2, t3, t4 = st.columns(4)
+
+    with t1:
+        st.metric("Amendements avant passage", tracking["remaining_before"])
+
+    with t2:
+        st.metric(
+            "Estimation standard",
+            format_duration(tracking["standard_eta_minutes"]),
+        )
+
+    with t3:
+        st.metric(
+            "Estimation rythme réel",
+            format_duration(tracking["realtime_eta_minutes"]),
+        )
+
+    with t4:
+        st.metric(
+            "Heure estimée de passage",
+            tracking["realtime_eta_clock"] or "—",
+        )
+
+    if tracking["remaining_before"] is not None and tracking["remaining_before"] <= 5:
+        st.warning("L’amendement suivi approche.")
+    elif tracking["remaining_before"] is not None and tracking["remaining_before"] <= 10:
+        st.info("L’amendement suivi entre dans une zone de vigilance.")
+
+st.markdown("---")
+
 with st.expander("Aperçu des données"):
     st.write(f"Texte examiné : {texte_numero}")
     if not df.empty:
-        preview = df[["numero", "sort", "date_sort", "etat_source", "page_url"]].copy()
+        preview = df[["numero", "sort", "date_sort", "terminal", "page_url"]].copy()
         st.dataframe(preview.head(50), use_container_width=True)
 
-st.markdown("---")
 st.caption(
-    "Version MVP. Le scan se fait par numéros d’amendements successifs."
+    "Version MVP. Les estimations sont indicatives et évoluent selon le rythme réel de la séance."
 )
